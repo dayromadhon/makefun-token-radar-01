@@ -1,21 +1,29 @@
-// The token radar's model: one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model, radar-2: one snapshot of the protocol universe in, one ranked board out.
 //
-// The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and may add
+// The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds the
 // pre-token protocols below the watchlist floor: the early rows the radar exists to find. A protocol is
 // pre-token when its index entry records no token (no market cap, no CoinGecko id, no symbol); the
 // snapshot's live-token protocols are kept apart and shown as the market's own values, never mixed into
 // the ranked board.
 //
-// Implied value follows only from the snapshot's own figures:
+// Implied value follows only from the snapshot's own figures, through one function applied to every
+// protocol alike — no name is ever special-cased:
 //
-//   base       = tvl_usd x BASE_MULTIPLE
-//   growth     = clamp(change_7d, -60, 120) per cent
-//   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
-//   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
-//   implied    = max(1, round(base x growthMult x maturity))
+//   base multiple  tiered by TVL: 0.30 below $100M, 0.25 from $100M, 0.20 from $1B.
+//                  A large TVL is worth more in dollars but less per dollar: the multiple falls as
+//                  the protocol saturates, so a mid-size grower can outrank a giant that has stalled.
+//   growth         clamp(change_7d, -40, 150) per cent; growthMult = 1 + growth/100 x weight, with
+//                  weight 0.6 on gains and 0.9 on losses — a 7-day fall is punished harder than a
+//                  rise is rewarded, because capital leaving is the sharper signal.
+//   maturity       0.55 + 0.45 x sqrt(min(age_days, 1460) / 1460); age unknown: 365 days. Longevity
+//                  with no token raises the implied value, but with diminishing returns: a protocol
+//                  that has run four years is not twice as proven as one that has run one.
+//   breadth        1 + 0.03 x min(chains - 1, 4): a protocol live on several chains reaches more
+//                  users than a single-chain one at the same TVL; capped at 1.12.
+//   implied        = max(1, round(tvl_usd x baseMultiple x growthMult x maturity x breadth))
 //
-// The constants are the house model's, stated in the dashboard and changeable in the model sandbox. No
-// protocol name is ever special-cased: the same function scores every row.
+// Age is the time since DefiLlama first listed the protocol — the best record of how long it has run
+// with no token. The dashboard recomputes every row with this same function and shows the check.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -42,32 +50,46 @@ export interface Snapshot {
 
 /** The model's constants, as the dashboard states them and the sandbox may change them. */
 export interface ModelConstants {
-  base_multiple: number;
-  growth_weight: number;
+  base_multiple_small: number;
+  base_multiple_mid: number;
+  base_multiple_large: number;
+  mid_tvl: number;
+  large_tvl: number;
+  growth_weight_up: number;
+  growth_weight_down: number;
   growth_floor: number;
   growth_cap: number;
   maturity_floor: number;
   maturity_range: number;
   maturity_days: number;
   unknown_age_days: number;
+  breadth_per_chain: number;
+  breadth_max_chains: number;
 }
 
 export const MODEL: ModelConstants = {
-  base_multiple: 0.25,
-  growth_weight: 0.5,
-  growth_floor: -60,
-  growth_cap: 120,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
-  maturity_days: 1095,
+  base_multiple_small: 0.3,
+  base_multiple_mid: 0.25,
+  base_multiple_large: 0.2,
+  mid_tvl: 100_000_000,
+  large_tvl: 1_000_000_000,
+  growth_weight_up: 0.6,
+  growth_weight_down: 0.9,
+  growth_floor: -40,
+  growth_cap: 150,
+  maturity_floor: 0.55,
+  maturity_range: 0.45,
+  maturity_days: 1460,
   unknown_age_days: 365,
+  breadth_per_chain: 0.03,
+  breadth_max_chains: 4,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-1';
+export const MODEL_VERSION = 'radar-2';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
-export const EARLY_ROWS = 160;
+export const EARLY_ROWS = 260;
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -100,6 +122,7 @@ export interface BoardRow {
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
+    breadth_multiplier: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -120,6 +143,7 @@ export interface RadarRow {
   implied_value_usd: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  breadth_multiplier: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -172,17 +196,36 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-/** The three multipliers and the implied value one protocol gets under `model`. */
-export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+/** The tiered base multiple for a TVL: smaller protocols earn more per TVL dollar. */
+export function baseMultiple(tvlUsd: number, model: ModelConstants): number {
+  if (tvlUsd >= model.large_tvl) return model.base_multiple_large;
+  if (tvlUsd >= model.mid_tvl) return model.base_multiple_mid;
+  return model.base_multiple_small;
+}
+
+/** The breadth multiplier for a chain count: 1.00 on one chain, +0.03 per extra chain to 1.12. */
+export function breadthMultiplier(chainCount: number, model: ModelConstants): number {
+  const extra = Math.min(Math.max(chainCount - 1, 0), model.breadth_max_chains);
+  return 1 + extra * model.breadth_per_chain;
+}
+
+// Note on determinism: impliedValue is a pure function of the protocol record and the constants —
+// no clock, no randomness, no map iteration order — so two runs over the sealed snapshot write
+// identical board bytes, and the dashboard's recompute in app.js must match it exactly.
+
+/** The four multipliers and the implied value one protocol gets under `model`. */
+export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { implied: number; baseMultiple: number; growthPct: number; growthMult: number; maturityMult: number; breadthMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const weight = growthPct >= 0 ? model.growth_weight_up : model.growth_weight_down;
+  const growthMult = 1 + (growthPct / 100) * weight;
   const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const base = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, growthPct, growthMult, maturityMult, age };
+  const maturityMult = model.maturity_floor + model.maturity_range * Math.sqrt(Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days);
+  const base = baseMultiple(protocol.tvl_usd, model);
+  const breadthMult = breadthMultiplier(protocol.chains.length, model);
+  const implied = Math.max(1, Math.round(protocol.tvl_usd * base * growthMult * maturityMult * breadthMult));
+  return { implied, baseMultiple: base, growthPct, growthMult, maturityMult, breadthMult, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -230,8 +273,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model);
-    return { p, implied, growthPct, growthMult, maturityMult, age };
+    const v = impliedValue(p, snapshot.as_of, model);
+    return { p, ...v };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -250,10 +293,11 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      base_multiple: model.base_multiple,
+      base_multiple: s.baseMultiple,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
+      breadth_multiplier: round4(s.breadthMult),
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
@@ -308,9 +352,29 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
+/** A second, different qualifying action for the same protocol, so the farm is not a single deposit. */
+function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): string {
+  const c = (p.category ?? '').toLowerCase();
+  const name = p.name;
+  const half = Math.max(10, Math.round(capital / 2));
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Borrow $${half} against the deposit on ${name} and repay it within a week, so the wallet shows both sides of the market.`;
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return `Swap $${half} through ${name}'s own router on ${chain} instead of an outside exchange, so the trade is counted on-protocol.`;
+  if (c.includes('bridge')) return `Bridge a second, smaller amount back through ${name} the following week, so the wallet shows repeat use rather than one hop.`;
+  if (c.includes('staking') || c.includes('restak')) return `Vote once in ${name}'s governance or delegate the stake to a validator the protocol lists, if it offers either.`;
+  if (c.includes('perpetual') || c.includes('derivative')) return `Close the hedge after a week and open a fresh one at half size, so the wallet shows ongoing trading rather than one trade.`;
+  if (c.includes('prediction')) return `Settle one market and place a second, smaller position in a different market on ${name}.`;
+  if (c.includes('curator') || c.includes('allocator')) return `Deposit a second tranche of $${half} into a different ${name} vault on ${chain} a week later.`;
+  if (c.includes('stable')) return `Use the stable asset in one on-chain payment or pool on ${chain}, rather than leaving it idle in the wallet.`;
+  if (c.includes('rwa')) return `Reinvest one yield payout from the ${name} asset instead of withdrawing it, so the position compounds.`;
+  if (c.includes('insurance')) return `Renew or extend the ${name} cover once, so the wallet shows a repeat customer rather than a one-off buyer.`;
+  return `Use a second feature of ${name} on ${chain} — a swap, a vote or a second deposit — within the first week.`;
+}
+
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived from
+ * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived from
  * the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
+ * Total cost is the capital plus roughly $10–$20 of gas over the hold; the exit step tests the unwind
+ * with a small withdrawal before the rest moves.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -329,6 +393,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '15 minutes to set up',
     },
     {
+      text: secondActionFor(p, capital, chain),
+      cost: `about $${capital >= 150 ? 6 : 3} of gas, no new capital`,
+      time: '10 minutes in the first week',
+    },
+    {
       text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.`,
       cost: 'about $2 of gas a week',
       time: '10 minutes a week',
@@ -344,9 +413,9 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '10 minutes',
     },
     {
-      text: `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.`,
-      cost: 'nothing but the log',
-      time: '5 minutes',
+      text: `Test the exit first: withdraw a tenth of the position, confirm it lands, then unwind the rest and log every transaction.`,
+      cost: 'about $2 of gas for the test withdrawal',
+      time: '15 minutes to unwind',
     },
   ];
 }
@@ -384,6 +453,7 @@ export function radarRow(row: BoardRow): RadarRow {
     implied_value_usd: row.implied_value_usd,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    breadth_multiplier: row.model.breadth_multiplier,
   };
 }
 
